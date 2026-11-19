@@ -300,12 +300,15 @@ def run_checks(data: dict, inv: pd.DataFrame, detail: pd.DataFrame, start=None, 
             f"票面价税合计 {r['票面价税合计']:.2f}", r["其中不征税"])
 
     # R03 发票级 sheet 交叉核对
+    # 注意：先按（销方 + 开票日期）匹配，再单独比金额。若把「金额差 ≤0.02」塞进匹配条件，
+    # 后面的金额不符判断永远不可能成立，报告会假报「全部一致」——这是 2026-11-19 修掉的 bug。
     inv_sheet = data.get("invoice")
     if inv_sheet is not None and not inv_sheet.empty:
         b, dropped = drop_total_rows(inv_sheet)
+        id_col = pick(b, "数电发票号码")
         numeric_ids = False
-        if len(b):
-            numeric_ids = pd.to_numeric(pick(b, "数电发票号码"), errors="coerce").notna().all()
+        if id_col is not None and len(b):
+            numeric_ids = bool(pd.to_numeric(id_col, errors="coerce").notna().all())
         if numeric_ids:
             add("中", "发票号精度失真(数值格式)", "",
                 f"「{sheets.get('invoice')}」的数电发票号码是数值格式，19 位超出 Excel 15 位精度，"
@@ -314,29 +317,44 @@ def run_checks(data: dict, inv: pd.DataFrame, detail: pd.DataFrame, start=None, 
         if dropped:
             add("中", "含合计行/小计行", "",
                 f"已剔除 {dropped} 行合计行，避免重复统计", None, sheets.get("invoice", ""))
+        seller_col = pick(b, "销方识别号")
         b = b.assign(
-            _seller=pick(b, "销方识别号").astype(str),
+            _seller=seller_col.astype(str) if seller_col is not None else "",
             _date=as_datetime(pick(b, "开票日期")),
             _total=to_num(pick(b, "价税合计")),
         )
-        matched, diffs = 0, []
+        matched, diffs, unmatched = 0, [], []
         for _, r in b.iterrows():
-            cand = inv[(inv["销方识别号"].astype(str) == r["_seller"])
-                       & (inv["开票日期"] == r["_date"])
-                       & ((inv["票面价税合计"] - r["_total"]).abs() <= 0.02)]
-            if len(cand) == 0:
+            rid = str(_val(r, "数电发票号码"))
+            if pd.isna(r["_date"]) or pd.isna(r["_total"]):
+                unmatched.append(rid)
+                continue
+            cand = inv[(inv["销方识别号"].astype(str) == str(r["_seller"]))
+                       & (inv["开票日期"] == r["_date"])]
+            if cand.empty:
+                unmatched.append(rid)
                 continue
             matched += 1
-            pick_row = cand.iloc[0]
+            # 同销方同日多张时取金额最接近的那张再比差额
+            cand = cand.assign(_d=(cand["票面价税合计"] - float(r["_total"])).abs())
+            pick_row = cand.sort_values("_d").iloc[0]
             dd = round(float(pick_row["票面价税合计"]) - float(r["_total"]), 2)
             if abs(dd) > 0.02:
                 diffs.append((pick_row["数电发票号码"], dd))
-        if matched != len(inv):
+        if len(b) != len(inv):
             add("中", "发票级表与明细表张数不一致", "",
-                f"发票基础信息匹配到 {matched} 张，信息汇总表 {len(inv)} 张，"
-                f"差 {len(inv) - matched} 张需人工核对", None, sheets.get("invoice", ""))
+                f"发票基础信息 {len(b)} 行（已剔除合计行），信息汇总表 {len(inv)} 张，"
+                f"差 {len(b) - len(inv)} 行需人工核对", None, sheets.get("invoice", ""))
+        if unmatched:
+            add("中", "发票级表有票未能匹配明细表", "、".join(unmatched[:10]),
+                f"共 {len(unmatched)} 张：发票基础信息里有、信息汇总表里找不到"
+                f"（销方+日期对不上），可能是漏导出或跨期", None, sheets.get("invoice", ""))
         for inv_id, dd in diffs[:20]:
-            add("中", "发票级金额与票面不符", inv_id, f"差 {dd:.2f} 元", dd, sheets.get("invoice", ""))
+            add("高", "发票级金额与票面不符", inv_id, f"差 {dd:.2f} 元", dd, sheets.get("invoice", ""))
+        if len(diffs) > 20:
+            add("中", "发票级金额与票面不符(其余)", "",
+                f"另有 {len(diffs) - 20} 张存在金额差异，完整清单见「异常清单」页",
+                sum(d[1] for d in diffs[20:]), sheets.get("invoice", ""))
 
     # R04 重复票（同销方 + 同金额 + 同分钟，均为正票）
     pos = inv[(inv["有效标记"] == "有效") & (inv["价税合计"] > 0)].copy()
@@ -526,8 +544,10 @@ def export_workbook(path: Path, inv: pd.DataFrame, detail: pd.DataFrame, issues:
     wb = Workbook()
     wb.remove(wb.active)
 
-    mask_ded = ((inv["发票票种"].astype(str).str.contains("增值税专用发票|铁路电子客票|航空运输电子客票", na=False)
-                 | inv["特定业务类型"].astype(str).str.contains("旅客运输", na=False))
+    kind = inv["发票票种"].astype(str)
+    special = inv["特定业务类型"].astype(str)
+    mask_ded = ((kind.apply(lambda s: any(k in s for k in DEDUCTIBLE_KINDS))
+                 | special.str.contains("旅客运输", na=False))
                 & (inv["有效标记"] == "有效"))
     inv = inv.copy()
     inv["可抵扣"] = ["是" if x else "否" for x in mask_ded]
@@ -693,8 +713,11 @@ def export_report(path: Path, inv, detail, issues, meta, checks, travel=None):
       f"其中税额 {money(tax)} 元；扣除不征税项目后的票面合计 {money(face)} 元。")
     A(f"2. 有效票 {n_valid} 张；被全额红冲作废 {n_void} 张；红字冲销 {n_red} 张。"
       f"红蓝成对、金额自然抵销，**不要单独删掉其中一边**。")
+    bad_pair = [i for i in issues if i["检查项"] in ("发票级金额与票面不符",
+                                                     "发票级金额与票面不符(其余)",
+                                                     "发票级表有票未能匹配明细表")]
     A(f"3. 发票级表（发票基础信息）合计 {money(face)} 元，与明细逐张核对"
-      + ("**全部一致**。" if not [i for i in issues if i['检查项'] == '发票级金额与票面不符'] else "存在差异，见第三节。"))
+      + ("**全部一致**。" if not bad_pair else f"有 {len(bad_pair)} 条对不上，见第三节。"))
     A(f"4. 明细与票面相差 {money(amt - face)} 元，全部来自 {len(un_taxed)} 张含「不征税」项目的票，"
       f"属正常口径差异，**不是错票**（见第四节）。")
     A(f"5. 本次共检出 {len(issues)} 条待关注项：高 {len(high)} 条、中 {len(mid)} 条、低 {len(low)} 条。")
@@ -838,7 +861,9 @@ def main(argv=None):
         raise SystemExit(f"文件不存在：{src}")
 
     data = load_all(src)
-    detail, _ = drop_total_rows(data["detail"])
+    detail, dropped_detail = drop_total_rows(data["detail"])
+    if dropped_detail:
+        print(f"[info] 明细表剔除合计行/小计行 {dropped_detail} 行")
     inv = build_invoices(detail)
     travel = build_travel(data, inv)
     issues = run_checks(data, inv, detail, args.start, args.end)
